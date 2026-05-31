@@ -1,1 +1,95 @@
+import requests
+import json
+import time
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+from time import sleep
+from collections import Counter
 
+response = requests.post(
+    'https://hh.ru/oauth/token',
+    data={
+        'grant_type': 'client_credentials',
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET
+    }
+)
+
+print(f"Status code: {response.status_code}")
+print(f"Response: {response.json()}")
+
+if response.status_code == 200:
+    token = response.json()['access_token']
+else:
+    print("Не удалось получить токен!")
+    raise Exception("Ошибка аутентификации")
+
+vacancies = []
+for page in range(0, 30):
+    print(f"Скачиваю страницу {page} ...")
+
+    resp = requests.get(
+        f'https://api.hh.ru/vacancies?employer_id=80&per_page=100&page={page}',
+        headers=headers
+    )
+
+    if resp.status_code == 200:
+        vacancies.extend(resp.json()['items'])
+    else:
+        print(f"Ошибка на странице {page}: {resp.status_code}")
+        break
+
+    time.sleep(1)
+
+print(f'Всего вакансий: {len(vacancies)}')
+
+CLIENT_ID = 'OHJ96QOLV7QIVQG5P7CMQA268SJOJT4HRTNM0M9RP42R3EKFA3NL57LL89FOHU5P'
+CLIENT_SECRET = 'L0F2VDCVHAABJP304TSK72BNRA99HNB6MT6FLMBH0U4HJKV2RG8HCHQSL92BK2PB'
+
+# Получаем токен
+response = requests.post(
+    'https://hh.ru/oauth/token',
+    data={
+        'grant_type': 'client_credentials',
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET
+    }
+)
+
+# Проверяем ответ
+print(f"Status code: {response.status_code}")
+print(f"Response: {response.json()}")
+
+if response.status_code == 200:
+    token = response.json()['access_token']
+else:
+    print("Не удалось получить токен!")
+    # Завершаем выполнение, если токен не получен
+    raise Exception("Ошибка аутентификации")
+
+# Заголовки для запросов
+headers = {
+    'Authorization': f'Bearer {token}',
+    'User-Agent': 'Zhavoro'
+}
+
+# Собираем вакансии
+vacancies = []
+for page in range(0, 30):
+    print(f"Скачиваю страницу {page} ...")
+
+    resp = requests.get(
+        f'https://api.hh.ru/vacancies?employer_id=80&per_page=100&page={page}',
+        headers=headers
+    )
+
+    if resp.status_code == 200:
+        vacancies.extend(resp.json()['items'])
+    else:
+        print(f"Ошибка на странице {page}: {resp.status_code}")
+        break
+
+    time.sleep(1)
+
+print(f'Всего вакансий: {len(vacancies)}')
