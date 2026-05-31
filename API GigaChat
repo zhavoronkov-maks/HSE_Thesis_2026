@@ -1,1 +1,246 @@
+#Заметки пишу для себя 
+#Установка библиотек
 
+import re
+import os
+import time
+import json
+import base64
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+#Настройки доступа
+GIGACHAT_CLIENT_ID = "019e38a6-5f77-7694-8435-5a1d9aa71b08"
+GIGACHAT_CLIENT_SECRET = "6e38801d-5687-4d42-99ea-8bd5e4012d0a"
+
+if not GIGACHAT_CLIENT_ID or not GIGACHAT_CLIENT_SECRET:
+    raise ValueError("Вставьте client_id и client_secret") # проверка, вынос ошибки
+
+#Файлы ввода/вывода
+INPUT_FILE = "2000_vacancy_names_and_descriptions.xlsx"
+OUTPUT_FILE = "output_gigachat_2000rows.xlsx"
+PROGRESS_FILE = "output_progress.xlsx"           # промежуточное автосохранение
+
+#Авторизация с повторными попытками
+def get_gigachat_token(client_id: str, client_secret: str, retries=3) -> str:
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    credentials = f"{client_id}:{client_secret}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "RqUID": "12345678-1234-1234-1234-123456789012",
+        "Authorization": f"Basic {encoded_credentials}"
+    }
+    data = {"scope": "GIGACHAT_API_PERS"}
+
+    for attempt in range(retries):
+        try:
+            response = requests.post(url, headers=headers, data=data, verify=False, timeout=30)
+            response.raise_for_status()
+            return response.json()["access_token"]
+        except Exception as e:
+            print(f"Ошибка получения токена (попытка {attempt+1}/{retries}): {e}") # проверка, вынос ошибки
+            time.sleep(2 ** attempt)
+    raise Exception("Не удалось получить токен GigaChat")
+
+print("Получаем токен GigaChat...")
+TOKEN = get_gigachat_token(GIGACHAT_CLIENT_ID, GIGACHAT_CLIENT_SECRET)
+print("Токен получен!")
+
+#Функция запроса к GigaChat с автоматическими повторными попытками
+def call_gigachat_with_retry(prompt: str, token: str, model: str = "GigaChat:latest", max_retries=5) -> str:
+    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 1500,
+        "stream": False
+    }
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, json=payload, verify=False, timeout=60)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
+        except requests.exceptions.RequestException as e:
+            print(f"Сетевая ошибка (попытка {attempt+1}/{max_retries}): {e}") # проверка, вынос ошибки
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(5 * (attempt + 1))  # делаем паузу
+        except Exception as e:
+            print(f"Неизвестная ошибка: {e}")
+            raise
+    raise Exception("Не удалось выполнить запрос после всех попыток")
+
+#Извлечение JSON из ответа
+def extract_json_from_response(text: str) -> str:
+    json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+    if json_match:
+        return json_match.group(1).strip()
+    json_match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
+    if json_match:
+        return json_match.group(1).strip()
+    array_match = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
+    if array_match:
+        return array_match.group(0).strip()
+    return text.strip()
+
+#Чтение файла
+print(f"Читаем {INPUT_FILE}...") # проверка, вынос ошибки
+if INPUT_FILE.endswith('.xlsx'):
+    df = pd.read_excel(INPUT_FILE, header=None)
+else:
+    df = pd.read_csv(INPUT_FILE, header=None)
+
+if len(df.columns) >= 2:
+    df.columns = ['title', 'description'] + [f'col_{i}' for i in range(2, len(df.columns))]
+    df = df[['title', 'description']]
+else:
+    df.columns = ['description']
+    df['title'] = ''  # проверка на заголовок
+
+print(f"Всего строк в файле: {len(df)}")
+
+#Восстановление прогресса
+if os.path.exists(PROGRESS_FILE):
+    print(f"Найден файл прогресса {PROGRESS_FILE}, загружаем...")
+    existing_df = pd.read_excel(PROGRESS_FILE)
+    # Проверяем на совпадение столбцов
+    if 'gigachat_response' in existing_df.columns:
+        # Объединяем берём ответы из существующего файла
+        df = df.copy()
+        # Предполагаем, что строки идут в том же порядке (по индексу)
+        df['gigachat_response'] = existing_df['gigachat_response'].reindex(df.index, fill_value='')
+        print(f"Загружено {existing_df['gigachat_response'].notna().sum()} ранее обработанных строк")
+    else:
+        print("Файл прогресса не содержит столбца 'gigachat_response', начинаем заново") #проверка, вынос ошибки
+        df['gigachat_response'] = ''
+else:
+    df['gigachat_response'] = ''
+    print("Начинаем обработку с нуля")
+
+#Добавляем столбец с временем обработки
+if 'processed_at' not in df.columns:
+    df['processed_at'] = ''
+
+#Обработка всех необработанных строк
+total_rows = len(df)
+print(f"\nНачинаем обработку {total_rows} строк (пропускаем уже готовые)...\n")
+
+for idx, row in df.iterrows():
+    #Пропускаем, если ответ уже есть
+    existing = row.get('gigachat_response', '')
+    if pd.notna(existing) and str(existing).strip() != '':
+        print(f"⏩ Строка {idx+1}/{total_rows} уже обработана, пропускаем")
+        continue
+
+    title = row['title'] if pd.notna(row['title']) else ''
+    description = row['description'] if pd.notna(row['description']) else ''
+
+    prompt = f"""Ты - СТРОГИЙ эксперт по проверке вакансий. Твоя задача - НАЙТИ ВСЕ проблемы, даже мелкие.
+
+НАЗВАНИЕ ВАКАНСИИ: {title}
+
+ОПИСАНИЕ ВАКАНСИИ: {description}
+
+ИЩИ ПРОБЛЕМЫ:
+
+1. **profanity** - мат, грубости, неуважительный тон ("должен", "обязан")
+
+2. **discrimination** - ЛЮБАЯ дискриминация:
+   - Возраст: "молодой", "до 35", "студент", "без пенсионеров"
+   - Пол: "девушка", "мужчина", "женщина", "парень"
+   - Внешность: "симпатичная", "презентабельная"
+   - Семейное положение: "без детей", "не замужем"
+
+3. **spelling** - ЛЮБЫЕ орфографические и пунктуационные ошибки
+
+4. **inconsistency** - противоречия:
+   - "Высокая зарплата" без указания суммы
+   - "Гибкий график" + "строго с 9 до 18"
+   - Требуют большой опыт + предлагают низкую зарплату
+   - Обещают "карьерный рост" без конкретики
+
+5. **title_mismatch** - название ≠ описанию:
+   - "Менеджер" а по факту продажи
+   - "Администратор" а по факту уборка
+
+ВНИМАНИЕ: Будь МАКСИМАЛЬНО строгим! Если есть ХОТЯ БЫ МАЛЕНЬКАЯ проблема - укажи её.
+
+Верни JSON массив:
+[
+  {{
+    "problem": "тип_проблемы",
+    "text": "конкретная фраза из вакансии",
+    "suggestion": "как исправить"
+  }}
+]
+
+Если проблем ДЕЙСТВИТЕЛЬНО нет (идеальная вакансия), верни: []
+
+Ответ (ТОЛЬКО JSON):"""
+
+    print(f"Строка {idx+1}/{total_rows}... ", end="", flush=True)
+    start_time = time.time()
+
+    try:
+        raw_response = call_gigachat_with_retry(prompt, TOKEN)
+        json_str = extract_json_from_response(raw_response)
+
+        #Валидация JSON
+        try:
+            parsed = json.loads(json_str)
+            if isinstance(parsed, list):
+                df.at[idx, 'gigachat_response'] = json_str
+                df.at[idx, 'processed_at'] = time.strftime("%Y-%m-%d %H:%M:%S")
+                if len(parsed) == 0:
+                    print("[] (нет проблем)") # проверка, вынос ошибки
+                else:
+                    print(f"Найдено проблем: {len(parsed)}")
+            else:
+                df.at[idx, 'gigachat_response'] = f"⚠️ Не массив: {json_str[:200]}"
+                print("Не массив") # проверка, вынос ошибки
+        except json.JSONDecodeError as e:
+            df.at[idx, 'gigachat_response'] = f"Ошибка JSON: {json_str[:200]}" # проверка, вынос ошибки
+            print(f"Ошибка парсинга JSON") # проверка, вынос ошибки
+            print(f"   Получено: {json_str[:200]}")
+
+    except Exception as e:
+        error_msg = f"Ошибка: {str(e)[:200]}" # проверка, вынос ошибки
+        df.at[idx, 'gigachat_response'] = error_msg
+        print(f"{error_msg}")
+
+    #Сохраняем прогресс ПОСЛЕ КАЖДОЙ строки
+    df.to_excel(PROGRESS_FILE, index=False)
+    # Также периодически сохраняем основной файл 
+    if (idx + 1) % 10 == 0:
+        df.to_excel(OUTPUT_FILE, index=False)
+        print(f"Промежуточное сохранение в {OUTPUT_FILE}")
+
+    # Пауза между запросами, чтобы не превысить лимиты GigaChat
+    time.sleep(1.5)
+
+#Финальное сохранение
+df.to_excel(OUTPUT_FILE, index=False)
+print(f"\nПолная обработка завершена!")
+print(f"📁 Итоговый файл: {OUTPUT_FILE}")
+print(f"📁 Файл прогресса (можно удалить после успеха): {PROGRESS_FILE}")
+
+# ── 10. Статистика ─────────────────────────────────────────────────────────────
+responses = df['gigachat_response'].fillna('')
+empty_count = sum(1 for r in responses if r.strip() == '[]')
+error_count = sum(1 for r in responses if 'ошибка' in r or 'предупреждение' in r) # проверка, вынос ошибки
+success_count = len(df) - empty_count - error_count
+
+print(f"\nСтатистика:")
+print(f"Вакансий с проблемами: {success_count}")
+print(f"Вакансий без проблем: {empty_count}")
+print(f"Ошибок: {error_count}")
