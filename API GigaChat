@@ -206,7 +206,7 @@ for idx, row in df.iterrows():
                 else:
                     print(f"Найдено проблем: {len(parsed)}")
             else:
-                df.at[idx, 'gigachat_response'] = f"⚠️ Не массив: {json_str[:200]}"
+                df.at[idx, 'gigachat_response'] = f"Не массив: {json_str[:200]}"
                 print("Не массив") # проверка, вынос ошибки
         except json.JSONDecodeError as e:
             df.at[idx, 'gigachat_response'] = f"Ошибка JSON: {json_str[:200]}" # проверка, вынос ошибки
